@@ -62,7 +62,7 @@ class CollectorRegistry(object):
         if labels is None:
             labels = {}
         for metric in self.collect():
-            for n, l, value in metric.samples:
+            for n, l, value, time in metric.samples:
                 if n == name and l == labels:
                     return value
         return None
@@ -90,11 +90,11 @@ class Metric(object):
         self.type = typ
         self.samples = []
 
-    def add_sample(self, name, labels, value):
+    def add_sample(self, name, labels, value, time):
         '''Add a sample to the metric.
 
         Internal-only, do not use.'''
-        self.samples.append((name, labels, value))
+        self.samples.append((name, labels, value, time))
 
     def __eq__(self, other):
         return (isinstance(other, Metric)
@@ -119,14 +119,15 @@ class CounterMetricFamily(Metric):
         if value is not None:
           self.add_metric([], value)
 
-    def add_metric(self, labels, value):
+    def add_metric(self, labels, value, time=None):
         '''Add a metric to the metric family.
 
         Args:
           labels: A list of label values
           value: The value of the metric.
+          time: Unix time in seconds, or None
         '''
-        self.samples.append((self.name, dict(zip(self._labelnames, labels)), value))
+        self.samples.append((self.name, dict(zip(self._labelnames, labels)), value, time))
 
 
 class GaugeMetricFamily(Metric):
@@ -144,14 +145,15 @@ class GaugeMetricFamily(Metric):
         if value is not None:
           self.add_metric([], value)
 
-    def add_metric(self, labels, value):
+    def add_metric(self, labels, value, time=None):
         '''Add a metric to the metric family.
 
         Args:
           labels: A list of label values
           value: A float
+          time: Unix time in seconds, or None
         '''
-        self.samples.append((self.name, dict(zip(self._labelnames, labels)), value))
+        self.samples.append((self.name, dict(zip(self._labelnames, labels)), value, time))
 
 
 class SummaryMetricFamily(Metric):
@@ -171,16 +173,17 @@ class SummaryMetricFamily(Metric):
         if count_value is not None:
           self.add_metric([], count_value, sum_value)
 
-    def add_metric(self, labels, count_value, sum_value):
+    def add_metric(self, labels, count_value, sum_value, time=None):
         '''Add a metric to the metric family.
 
         Args:
           labels: A list of label values
           count_value: The count value of the metric.
           sum_value: The sum value of the metric.
+          time: Unix time in seconds, or None
         '''
-        self.samples.append((self.name + '_count', dict(zip(self._labelnames, labels)), count_value))
-        self.samples.append((self.name + '_sum', dict(zip(self._labelnames, labels)), sum_value))
+        self.samples.append((self.name + '_count', dict(zip(self._labelnames, labels)), count_value, time))
+        self.samples.append((self.name + '_sum', dict(zip(self._labelnames, labels)), sum_value, time))
 
 
 class HistogramMetricFamily(Metric):
@@ -200,7 +203,7 @@ class HistogramMetricFamily(Metric):
         if buckets is not None:
           self.add_metric([], buckets, sum_value)
 
-    def add_metric(self, labels, buckets, sum_value):
+    def add_metric(self, labels, buckets, sum_value, time=None):
         '''Add a metric to the metric family.
 
         Args:
@@ -208,12 +211,13 @@ class HistogramMetricFamily(Metric):
           buckets: A list of pairs of bucket names and values.
               The buckets must be sorted, and +Inf present.
           sum_value: The sum value of the metric.
+          time: Unix time in seconds, or None
         '''
         for bucket, value in buckets:
-          self.samples.append((self.name + '_bucket', dict(list(zip(self._labelnames, labels)) + [('le', bucket)]), value))
+          self.samples.append((self.name + '_bucket', dict(list(zip(self._labelnames, labels)) + [('le', bucket)]), value, time))
         # +Inf is last and provides the count value.
-        self.samples.append((self.name + '_count', dict(zip(self._labelnames, labels)), buckets[-1][1]))
-        self.samples.append((self.name + '_sum', dict(zip(self._labelnames, labels)), sum_value))
+        self.samples.append((self.name + '_count', dict(zip(self._labelnames, labels)), buckets[-1][1], time))
+        self.samples.append((self.name + '_sum', dict(zip(self._labelnames, labels)), sum_value, time))
 
 
 class _MutexValue(object):
@@ -297,13 +301,18 @@ class _LabelWrapper(object):
         with self._lock:
             del self._metrics[labelvalues]
 
+    def clear_times(self):
+        '''Delete all values for times other than None (now)'''
+        for labels, metric in self._metrics.items():
+            metric.clear_times()
+
     def _samples(self):
         with self._lock:
             metrics = self._metrics.copy()
         for labels, metric in metrics.items():
             series_labels = list(dict(zip(self._labelnames, labels)).items())
-            for suffix, sample_labels, value in metric._samples():
-                yield (suffix, dict(series_labels + list(sample_labels.items())), value)
+            for suffix, sample_labels, value, time in metric._samples():
+                yield (suffix, dict(series_labels + list(sample_labels.items())), value, time)
 
 
 def _MetricWrapper(cls):
@@ -334,8 +343,8 @@ def _MetricWrapper(cls):
 
         def collect():
             metric = Metric(full_name, documentation, cls._type)
-            for suffix, labels, value in collector._samples():
-                metric.add_sample(full_name + suffix, labels, value)
+            for suffix, labels, value, time in collector._samples():
+                metric.add_sample(full_name + suffix, labels, value, time)
             return [metric]
         collector.collect = collect
 
@@ -420,7 +429,7 @@ class Counter(object):
         return ExceptionCounter(self)
 
     def _samples(self):
-        return (('', {}, self._value.get()), )
+        return (('', {}, self._value.get(), time), )
 
 
 @_MetricWrapper
@@ -465,19 +474,36 @@ class Gauge(object):
     _reserved_labelnames = []
 
     def __init__(self, name, labelnames, labelvalues):
-        self._value = _ValueClass(name, labelnames, labelvalues)
+        self._values = {}
+        self._name = name
+        self._labelnames = labelnames
+        self._labelvalues = labelvalues
 
-    def inc(self, amount=1):
+    def _ensure_value(self, time):
+        if time not in self._values:
+            self._values[time] = _ValueClass(
+                self._name, self._labelnames, self._labelvalues)
+
+    def clear_times(self):
+        '''Delete all values for times other than None (now)'''
+        for time in self._values.keys():
+            if time is not None:
+                del self._values[time]
+            
+    def inc(self, amount=1, time=None):
         '''Increment gauge by the given amount.'''
-        self._value.inc(amount)
+        self._ensure_value(time)
+        self._values[time].inc(amount)
 
-    def dec(self, amount=1):
+    def dec(self, amount=1, time=None):
         '''Decrement gauge by the given amount.'''
-        self._value.inc(-amount)
+        self._ensure_value(time)
+        self._values[time].inc(-amount)
 
-    def set(self, value):
+    def set(self, value, time=None):
         '''Set gauge to the given value.'''
-        self._value.set(float(value))
+        self._ensure_value(time)
+        self._values[time].set(float(value))
 
     def set_to_current_time(self):
         '''Set gauge to the current unixtime.'''
@@ -543,11 +569,12 @@ class Gauge(object):
         multiple threads. All other methods of the Gauge become NOOPs.
         '''
         def samples(self):
-            return (('', {}, float(f())), )
+            return (('', {}, float(f()), None),)
         self._samples = types.MethodType(samples, self)
 
     def _samples(self):
-        return (('', {}, self._value.get()), )
+        l = [('', {}, v.get(), k) for k, v in self._values.items()]
+        return sorted(l, key=lambda t: t[3])
 
 
 @_MetricWrapper
@@ -621,8 +648,8 @@ class Summary(object):
 
     def _samples(self):
         return (
-            ('_count', {}, self._count.get()),
-            ('_sum', {}, self._sum.get()))
+            ('_count', {}, self._count.get(), None),
+            ('_sum', {}, self._sum.get(), None))
 
 
 def _floatToGoString(d):
@@ -733,8 +760,8 @@ class Histogram(object):
         acc = 0
         for i, bound in enumerate(self._upper_bounds):
             acc += self._buckets[i].get()
-            samples.append(('_bucket', {'le': _floatToGoString(bound)}, acc))
-        samples.append(('_count', {}, acc))
-        samples.append(('_sum', {}, self._sum.get()))
+            samples.append(('_bucket', {'le': _floatToGoString(bound)}, acc, None))
+        samples.append(('_count', {}, acc, None))
+        samples.append(('_sum', {}, self._sum.get(), None))
         return tuple(samples)
 

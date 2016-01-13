@@ -7,6 +7,7 @@ import socket
 import time
 import threading
 from contextlib import closing
+import json
 
 from . import core
 try:
@@ -34,7 +35,7 @@ def generate_latest(registry=core.REGISTRY):
         output.append('# HELP {0} {1}'.format(
             metric.name, metric.documentation.replace('\\', r'\\').replace('\n', r'\n')))
         output.append('\n# TYPE {0} {1}\n'.format(metric.name, metric.type))
-        for name, labels, value in metric.samples:
+        for name, labels, value, time in sorted(metric.samples, key=lambda t: t[3] or 0):
             if labels:
                 labelstr = '{{{0}}}'.format(','.join(
                     ['{0}="{1}"'.format(
@@ -42,7 +43,13 @@ def generate_latest(registry=core.REGISTRY):
                      for k, v in sorted(labels.items())]))
             else:
                 labelstr = ''
-            output.append('{0}{1} {2}\n'.format(name, labelstr, core._floatToGoString(value)))
+            if time is None:
+                timestr = ''
+            else:
+                # Use json.dumps over str, to prevent XYeZ format longs
+                timestr = ' ' + json.dumps(int(time * 1000))
+            output.append('{0}{1} {2}{3}\n'.format(
+                name, labelstr, core._floatToGoString(value), timestr))
     return ''.join(output).encode('utf-8')
 
 
